@@ -1,0 +1,6 @@
+{
+  "name": "freecall-worker",
+  "version": "1.0.0",
+  "private": true,
+  "description": "FreeCall signaling server for Cloudflare Workers (single file, no dependencies)"
+}
