@@ -460,6 +460,7 @@ module.exports = { Hub, DEFAULT_LIMITS, CALL_ID_RE };
 __defs['./directory'] = function (module, exports, require) {
 'use strict';
 const identity = require('./identity');
+const phone = require('./phone');
 
 class HttpError extends Error {
   constructor(status, code) {
@@ -472,6 +473,9 @@ class HttpError extends Error {
 const UID_RE = /^[A-Za-z0-9_.:-]{1,128}$/;
 const FORBIDDEN_NAME_CHARS = /[\p{C}‪-‮⁦-⁩]/u;
 const MAX_AVATAR_BYTES = 24 * 1024;
+const MAX_MATCH_HASHES = 1000;
+const MAX_MATCH_RESULTS = 500;
+const MAX_CLAIMANTS = 5; // accounts returned per phone hash
 
 /** Validates and normalises a display name. Returns the cleaned name or null. */
 function cleanUsername(raw) {
@@ -513,6 +517,11 @@ class Directory {
     this.now = now;
   }
 
+  /**
+   * @param {string} uid Firebase uid (from the verified token)
+   * @param {object} body request body
+   * body.discoverable/body.phoneHash: opt-in contact discovery with a SELF-DECLARED, UNVERIFIED number (see below).
+   */
   async register(uid, body) {
     if (!body || typeof body !== 'object') throw new HttpError(400, 'bad_request');
     const username = cleanUsername(body.username);
@@ -533,12 +542,71 @@ class Directory {
       createdAt: prev && prev.createdAt ? prev.createdAt : t,
       updatedAt: t,
     });
-    return { uid, freecallId };
+    // Contact discovery is opt-in. There is NO SMS verification: the phone-number hash is whatever the client
+    // declares, so it proves nothing about who owns the number (see matchContacts).
+    let discoverable;
+    if (body.discoverable === true) {
+      if (!phone.isPhoneHash(body.phoneHash)) throw new HttpError(400, 'bad_hash');
+      await this.store.setPhone(uid, body.phoneHash);
+      discoverable = true;
+    } else if (body.discoverable === false) {
+      await this.store.clearPhone(uid);
+      discoverable = false;
+    } else {
+      const cur = await this.store.getUser(uid);
+      discoverable = !!(cur && cur.phoneHash);
+    }
+    return { uid, freecallId, discoverable };
   }
 
   async me(uid) {
     const u = await this.store.getUser(uid);
-    return u ? publicProfile(uid, u) : null;
+    return u ? { ...publicProfile(uid, u), discoverable: !!u.phoneHash } : null;
+  }
+
+  /** Turns "findable by phone number" on (with the hash of the user's own, unverified number) or off. */
+  async setDiscoverable(uid, enabled, phoneHash) {
+    if (typeof enabled !== 'boolean') throw new HttpError(400, 'bad_request');
+    if (!(await this.store.getUser(uid))) throw new HttpError(409, 'not_registered');
+    if (!enabled) {
+      await this.store.clearPhone(uid);
+      return { discoverable: false };
+    }
+    if (!phone.isPhoneHash(phoneHash)) throw new HttpError(400, 'bad_hash');
+    await this.store.setPhone(uid, phoneHash);
+    return { discoverable: true };
+  }
+
+  /**
+   * Which of these phone-number hashes are claimed by FreeCall users who made themselves discoverable?
+   * IMPORTANT: claims are unverified (no SMS), so a match only means "this account says it has that number".
+   * Several accounts may claim the same number (at most MAX_CLAIMANTS are returned per hash) and every match is
+   * flagged `verified:false`; the app must tell the user so and offer key/safety-number verification.
+   * Only discoverable callers may ask, people who blocked the caller are hidden, the caller itself is skipped,
+   * no phone number is ever returned and avatars are left out (fetch them with /v1/lookup).
+   */
+  async matchContacts(uid, hashes) {
+    if (!Array.isArray(hashes) || hashes.length === 0 || hashes.length > MAX_MATCH_HASHES) throw new HttpError(400, 'bad_request');
+    for (const h of hashes) if (!phone.isPhoneHash(h)) throw new HttpError(400, 'bad_hash');
+    const me = await this.store.getUser(uid);
+    if (!me) throw new HttpError(409, 'not_registered');
+    if (!me.phoneHash) throw new HttpError(403, 'phone_required');
+    const found = await this.store.getUidsByPhoneHashes([...new Set(hashes)]);
+    const matches = [];
+    outer: for (const [hash, uids] of found) {
+      let n = 0;
+      for (const otherUid of uids) {
+        if (matches.length >= MAX_MATCH_RESULTS) break outer;
+        if (n >= MAX_CLAIMANTS) break;
+        if (otherUid === uid) continue;
+        const u = await this.store.getUser(otherUid);
+        if (!u || u.phoneHash !== hash) continue;
+        if (await this.store.isBlocked(otherUid, uid)) continue;
+        matches.push({ hash, verified: false, profile: { ...publicProfile(otherUid, u), avatar: '' } });
+        n++;
+      }
+    }
+    return { matches };
   }
 
   /** @param {{id?: string, uid?: string}} q */
@@ -797,6 +865,32 @@ module.exports = {
 };
 
 };
+__defs['./phone'] = function (module, exports, require) {
+'use strict';
+/** WebCrypto version of server/src/phone.js (same hash, async). See that file for the privacy notes. */
+const E164_RE = /^\+[1-9][0-9]{6,14}$/;
+const HASH_RE = /^[A-Za-z0-9_-]{43}$/;
+const PREFIX = 'FreeCall-PHONE-v1|';
+
+function isE164(s) {
+  return typeof s === 'string' && E164_RE.test(s);
+}
+
+function isPhoneHash(s) {
+  return typeof s === 'string' && HASH_RE.test(s);
+}
+
+async function phoneHash(e164) {
+  if (!isE164(e164)) throw new TypeError('not an E.164 number');
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(PREFIX + e164)));
+  let s = '';
+  for (let i = 0; i < digest.length; i++) s += String.fromCharCode(digest[i]);
+  return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+module.exports = { isE164, isPhoneHash, phoneHash, PREFIX };
+
+};
 __defs['./turn'] = function (module, exports, require) {
 'use strict';
 /**
@@ -825,7 +919,7 @@ __defs['./store-do'] = function (module, exports, require) {
 /**
  * Directory store on Durable Object storage (SQLite-backed, persistent across restarts and deployments).
  * Same interface as server/src/store-memory.js and store-firestore.js. Keys use '|' as separator because
- * '|' can never appear in a uid (UID_RE) or a FreeCall ID.
+ * '|' can never appear in a uid (UID_RE), a FreeCall ID or a phone hash (base64url).
  */
 class DoStore {
   /** @param {{get:Function,put:Function,delete:Function,list:Function}} storage DurableObjectStorage */
@@ -850,8 +944,37 @@ class DoStore {
     }
     const owner = await this.s.get(`i|${profile.freecallId}`);
     if (owner && owner !== uid) await this.deleteUser(owner);
-    await this.s.put(`u|${uid}`, { ...profile });
+    await this.s.put(`u|${uid}`, prev && prev.phoneHash ? { ...profile, phoneHash: prev.phoneHash } : { ...profile });
     await this.s.put(`i|${profile.freecallId}`, uid);
+  }
+
+  /** Records uid's self-declared (unverified) phone-number hash; many users may claim the same hash. */
+  async setPhone(uid, hash) {
+    const u = await this.s.get(`u|${uid}`);
+    if (!u) throw new Error('unknown user');
+    if (u.phoneHash && u.phoneHash !== hash) await this.s.delete(`h|${u.phoneHash}|${uid}`);
+    u.phoneHash = hash;
+    await this.s.put(`u|${uid}`, u);
+    await this.s.put(`h|${hash}|${uid}`, true);
+  }
+
+  async clearPhone(uid) {
+    const u = await this.s.get(`u|${uid}`);
+    if (!u || !u.phoneHash) return;
+    await this.s.delete(`h|${u.phoneHash}|${uid}`);
+    delete u.phoneHash;
+    await this.s.put(`u|${uid}`, u);
+  }
+
+  /** @returns {Promise<Map<string,string[]>>} hash -> uids that claim it (only hashes that exist) */
+  async getUidsByPhoneHashes(hashes) {
+    const out = new Map();
+    for (const h of hashes) {
+      const prefix = `h|${h}|`;
+      const keys = [...(await this.s.list({ prefix, limit: 20 })).keys()];
+      if (keys.length) out.set(h, keys.map((k) => k.slice(prefix.length)));
+    }
+    return out;
   }
 
   async setPushToken(uid, token) {
@@ -887,6 +1010,7 @@ class DoStore {
   async deleteUser(uid) {
     const u = await this.s.get(`u|${uid}`);
     if (u && (await this.s.get(`i|${u.freecallId}`)) === uid) await this.s.delete(`i|${u.freecallId}`);
+    if (u && u.phoneHash) await this.s.delete(`h|${u.phoneHash}|${uid}`);
     await this.s.delete(`u|${uid}`);
     await this.s.delete(`p|${uid}`);
     const blocks = [...(await this.s.list({ prefix: `b|${uid}|` })).keys()];
@@ -1161,6 +1285,16 @@ class FreeCallHub {
     if (method === 'POST' && path === '/v1/register') {
       limit('register', 10);
       return jsonResponse(200, await this.directory.register(uid, await readJson(request)));
+    }
+    if (method === 'PUT' && path === '/v1/discoverable') {
+      limit('discoverable', 20);
+      const body = await readJson(request);
+      return jsonResponse(200, await this.directory.setDiscoverable(uid, body.enabled, body.phoneHash));
+    }
+    if (method === 'POST' && path === '/v1/contacts/match') {
+      limit('match', 6, 3600 * 1000);
+      const body = await readJson(request);
+      return jsonResponse(200, await this.directory.matchContacts(uid, body.hashes));
     }
     if (method === 'GET' && path === '/v1/me') {
       limit('me', 60);
